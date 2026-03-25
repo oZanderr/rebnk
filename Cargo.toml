@@ -1,0 +1,10 @@
+[package]
+name = "rebnk"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rebnk"
+path = "src/lib.rs"
+
+[dependencies]

@@ -1,5 +1,9 @@
 //! Wwise `.bnk` soundbank parser and repacker.
 //!
+//! Handles both DIDX-indexed WEMs and WEMs only referenced from HIRC Sound
+//! objects.  DIDX entries pointing past the DATA section (streamed/external
+//! WEMs) are skipped safely instead of panicking.
+//!
 //! # Example
 //! ```no_run
 //! use rebnk::{parse_bnk, pack};
@@ -14,7 +18,7 @@
 //! pack(&bnk, &replacements, Path::new("out/Init.bnk")).unwrap();
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -26,6 +30,9 @@ pub struct WemEntry {
     pub size: u32,
     pub padding: u32,
     pub data: Vec<u8>,
+    /// Whether this entry was found in the DIDX table.
+    /// `false` means it was discovered via a HIRC Sound object.
+    pub in_didx: bool,
 }
 
 /// An opaque BNK section (anything other than DIDX/DATA).
@@ -91,11 +98,24 @@ fn write_section(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
 
 /// Parse a `.bnk` file into a [`BnkFile`].
 ///
-/// Sections are read sequentially. DIDX + DATA are split into individual
+/// Sections are read sequentially.  DIDX + DATA are split into individual
 /// [`WemEntry`] values; all other sections are stored as opaque blobs.
+///
+/// After DIDX parsing, the HIRC section is scanned for embedded Sound objects
+/// (type 2, stream-type 0) whose source ID is not already in the DIDX.  These
+/// "HIRC-only" WEMs are located in the DATA section by scanning for a RIFF
+/// header whose size matches the expected `InMemoryMediaSize`.
+///
+/// DIDX entries whose offset+size extends past the DATA section (typically
+/// streamed/external WEMs) are safely skipped.
 pub fn parse_bnk(path: &Path) -> Result<BnkFile> {
     let raw = fs::read(path)?;
-    let b = raw.as_slice();
+    parse_bnk_from_bytes(&raw, path)
+}
+
+/// Parse a BNK from an in-memory byte slice.
+pub fn parse_bnk_from_bytes(raw: &[u8], path: &Path) -> Result<BnkFile> {
+    let b = raw;
     let n = b.len();
 
     if n < 8 {
@@ -113,6 +133,12 @@ pub fn parse_bnk(path: &Path) -> Result<BnkFile> {
         wems: Vec::new(),
         sections: Vec::new(),
     };
+
+    let mut didx_ids: HashSet<u32> = HashSet::new();
+    let mut data_body_start: usize = 0;
+    let mut data_body_size: usize = 0;
+    let mut hirc_body_start: usize = 0;
+    let mut hirc_body_size: usize = 0;
 
     let mut i = 0usize;
 
@@ -138,6 +164,8 @@ pub fn parse_bnk(path: &Path) -> Result<BnkFile> {
             }
             let data_sec_sz = read_le_u32(b, ds + 4) as usize;
             let db = ds + 8;
+            data_body_start = db;
+            data_body_size = data_sec_sz;
 
             let mut eo = i + 8;
             for e in 0..num_entries {
@@ -145,22 +173,28 @@ pub fn parse_bnk(path: &Path) -> Result<BnkFile> {
                 let off = read_le_u32(b, eo + 4);
                 let sz = read_le_u32(b, eo + 8);
 
-                let padding = if e != num_entries - 1 && !sz.is_multiple_of(16) {
-                    16 - sz % 16
-                } else {
-                    0
-                };
-
                 let start = db + off as usize;
                 let end = start + sz as usize;
 
-                bnk.wems.push(WemEntry {
-                    id,
-                    offset: off,
-                    size: sz,
-                    padding,
-                    data: b[start..end].to_vec(),
-                });
+                // Skip entries that point outside the DATA section
+                // (streamed/external WEMs whose data is not in this file)
+                if end <= n && (off as usize + sz as usize) <= data_sec_sz {
+                    let padding = if e != num_entries - 1 && !sz.is_multiple_of(16) {
+                        16 - sz % 16
+                    } else {
+                        0
+                    };
+
+                    didx_ids.insert(id);
+                    bnk.wems.push(WemEntry {
+                        id,
+                        offset: off,
+                        size: sz,
+                        padding,
+                        data: b[start..end].to_vec(),
+                        in_didx: true,
+                    });
+                }
 
                 eo += 12;
             }
@@ -168,6 +202,10 @@ pub fn parse_bnk(path: &Path) -> Result<BnkFile> {
             bnk.sections.push(Section::WemData);
             i = ds + 8 + data_sec_sz;
         } else {
+            if &tag == b"HIRC" {
+                hirc_body_start = i + 8;
+                hirc_body_size = sec_sz;
+            }
             bnk.sections.push(Section::Raw(RawSection {
                 tag,
                 body: b[i + 8..i + 8 + sec_sz].to_vec(),
@@ -176,7 +214,80 @@ pub fn parse_bnk(path: &Path) -> Result<BnkFile> {
         }
     }
 
+    // ── HIRC scan: discover embedded WEMs not in DIDX ────────────────────
+    if hirc_body_size > 0 && data_body_size > 0 && hirc_body_start + 4 <= n {
+        let num_objects = read_le_u32(b, hirc_body_start) as usize;
+        let mut pos = hirc_body_start + 4;
+
+        for _ in 0..num_objects {
+            if pos + 5 > n {
+                break;
+            }
+            let obj_type = b[pos];
+            let obj_size = read_le_u32(b, pos + 1) as usize;
+            let obj_body = pos + 9;
+            let obj_end = pos + 5 + obj_size;
+
+            // Type 2 = Sound SFX
+            if obj_type == 2 && obj_end <= n && obj_body + 13 <= n {
+                let stream_type = b[obj_body + 4];
+                let source_id = read_le_u32(b, obj_body + 5);
+                let file_size = read_le_u32(b, obj_body + 9);
+
+                // stream_type 0 = embedded data, and not already found in DIDX
+                if stream_type == 0
+                    && file_size > 0
+                    && !didx_ids.contains(&source_id)
+                    && let Some(offset) =
+                        find_wem_in_data(b, data_body_start, data_body_size, file_size)
+                {
+                    didx_ids.insert(source_id);
+                    bnk.wems.push(WemEntry {
+                        id: source_id,
+                        offset: offset as u32,
+                        size: file_size,
+                        padding: if !file_size.is_multiple_of(16) {
+                            16 - file_size % 16
+                        } else {
+                            0
+                        },
+                        data: b[data_body_start + offset
+                            ..data_body_start + offset + file_size as usize]
+                            .to_vec(),
+                        in_didx: false,
+                    });
+                }
+            }
+
+            pos = pos + 5 + obj_size;
+        }
+    }
+
     Ok(bnk)
+}
+
+/// Scan the DATA section for a WEM (RIFF header) at 16-byte aligned positions
+/// whose total size matches `expected_size`.
+fn find_wem_in_data(
+    b: &[u8],
+    data_body_start: usize,
+    data_body_size: usize,
+    expected_size: u32,
+) -> Option<usize> {
+    let data_end = data_body_start + data_body_size;
+    let expected = expected_size as usize;
+
+    let mut pos = data_body_start;
+    while pos + expected <= data_end && pos + 12 <= b.len() {
+        if &b[pos..pos + 4] == b"RIFF" {
+            let riff_size = read_le_u32(b, pos + 4) as usize;
+            if riff_size + 8 == expected {
+                return Some(pos - data_body_start);
+            }
+        }
+        pos += 16;
+    }
+    None
 }
 
 /// Extract all WEM streams to `out_root/<name>/`.
@@ -193,9 +304,12 @@ pub fn extract(bnk: &BnkFile, out_root: &Path) -> Result<()> {
 
 /// Repack a soundbank with replacement WEM data.
 ///
-/// `replacements` maps WEM IDs to new audio bytes. Entries without a
-/// replacement keep their original data. Sections are written in their
+/// `replacements` maps WEM IDs to new audio bytes.  Entries without a
+/// replacement keep their original data.  Sections are written in their
 /// original order.
+///
+/// WEMs that were discovered via HIRC (not originally in the DIDX) are added
+/// to the DIDX in the output so the repacked BNK is self-consistent.
 pub fn pack(bnk: &BnkFile, replacements: &HashMap<u32, Vec<u8>>, output_path: &Path) -> Result<()> {
     let last_idx = bnk.wems.len().saturating_sub(1);
 

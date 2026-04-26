@@ -302,15 +302,13 @@ pub fn extract(bnk: &BnkFile, out_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Repack a soundbank with replacement WEM data.
+/// Repack a soundbank with replacement WEM data into an in-memory buffer.
 ///
-/// `replacements` maps WEM IDs to new audio bytes.  Entries without a
-/// replacement keep their original data.  Sections are written in their
-/// original order.
-///
-/// WEMs that were discovered via HIRC (not originally in the DIDX) are added
-/// to the DIDX in the output so the repacked BNK is self-consistent.
-pub fn pack(bnk: &BnkFile, replacements: &HashMap<u32, Vec<u8>>, output_path: &Path) -> Result<()> {
+/// Same semantics as [`pack`], but returns the rebuilt BNK bytes instead of
+/// writing them to disk. Use this when the caller plans to feed the bytes
+/// straight into another writer (e.g. a pak builder) and wants to avoid an
+/// intermediate temp file.
+pub fn pack_to_bytes(bnk: &BnkFile, replacements: &HashMap<u32, Vec<u8>>) -> Result<Vec<u8>> {
     let last_idx = bnk.wems.len().saturating_sub(1);
 
     let mut data_body: Vec<u8> = Vec::new();
@@ -356,10 +354,24 @@ pub fn pack(bnk: &BnkFile, replacements: &HashMap<u32, Vec<u8>>, output_path: &P
         }
     }
 
+    Ok(out)
+}
+
+/// Repack a soundbank with replacement WEM data and write to disk.
+///
+/// `replacements` maps WEM IDs to new audio bytes.  Entries without a
+/// replacement keep their original data.  Sections are written in their
+/// original order.
+///
+/// WEMs that were discovered via HIRC (not originally in the DIDX) are added
+/// to the DIDX in the output so the repacked BNK is self-consistent.
+pub fn pack(bnk: &BnkFile, replacements: &HashMap<u32, Vec<u8>>, output_path: &Path) -> Result<()> {
+    let bytes = pack_to_bytes(bnk, replacements)?;
+
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(output_path, &out)?;
+    fs::write(output_path, &bytes)?;
 
     Ok(())
 }

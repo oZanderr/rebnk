@@ -375,3 +375,531 @@ pub fn pack(bnk: &BnkFile, replacements: &HashMap<u32, Vec<u8>>, output_path: &P
 
     Ok(())
 }
+
+/// Wwise property ids for the baked low/high-pass filter cutoffs.
+const PROP_LPF: u8 = 3;
+const PROP_HPF: u8 = 4;
+
+/// Zero the baked LPF/HPF properties on every `CAkSound` whose source id is in `source_ids`, so
+/// replaced audio plays without the always-on low/high-pass those sounds carry.
+///
+/// Operates in place on the HIRC section. LPF/HPF values are 4-byte unions, so this changes no
+/// object sizes (no reserialization). Returns the number of LPF/HPF values zeroed. Sounds with a
+/// layout this does not understand (effect slots, inline source media) are skipped.
+///
+/// Targets the Wwise bank version 145 `CAkSound` layout used by Marvel Rivals.
+pub fn clear_sound_filters(bnk: &mut BnkFile, source_ids: &HashSet<u32>) -> usize {
+    for sec in &mut bnk.sections {
+        if let Section::Raw(rs) = sec
+            && &rs.tag == b"HIRC"
+        {
+            return clear_filters_in_hirc(&mut rs.body, source_ids);
+        }
+    }
+    0
+}
+
+fn clear_filters_in_hirc(body: &mut [u8], source_ids: &HashSet<u32>) -> usize {
+    let n = body.len();
+    if n < 4 {
+        return 0;
+    }
+    let num_objects = read_le_u32(body, 0) as usize;
+    let mut pos = 4usize;
+    let mut cleared = 0usize;
+
+    for _ in 0..num_objects {
+        if pos + 5 > n {
+            break;
+        }
+        let obj_type = body[pos];
+        let obj_size = read_le_u32(body, pos + 1) as usize;
+        let obj_body = pos + 9; // after type(1) + size(4) + ulID(4)
+        let obj_end = pos + 5 + obj_size;
+        if obj_end > n {
+            break;
+        }
+
+        // Type 2 = CAkSound; sourceID is at obj_body + 5 (after ulPluginID + StreamType).
+        if obj_type == 2 && obj_body + 9 <= n {
+            let source_id = read_le_u32(body, obj_body + 5);
+            if source_ids.contains(&source_id) {
+                cleared += zero_sound_filter_props(body, obj_body, obj_end);
+            }
+        }
+
+        pos = obj_end;
+    }
+    cleared
+}
+
+/// Walk a `CAkSound`'s `NodeBaseParams` to the `NodeInitialParams` prop bundle and zero any baked
+/// LPF/HPF values. Returns the count zeroed; returns 0 on any layout it does not recognize.
+fn zero_sound_filter_props(body: &mut [u8], obj_body: usize, obj_end: usize) -> usize {
+    let mut pos = obj_body;
+
+    // AkBankSourceData: ulPluginID(4) StreamType(1) sourceID(4) uInMemoryMediaSize(4) uSourceBits(1)
+    if pos + 14 > obj_end {
+        return 0;
+    }
+    if body[pos + 13] & 0x80 != 0 {
+        return 0; // bHasSource: inline source plugin data, unsupported layout
+    }
+    pos += 14;
+
+    // NodeInitialFxParams: bIsOverrideParentFX(1) uNumFx(1) [+ fx list when uNumFx > 0]
+    if pos + 2 > obj_end {
+        return 0;
+    }
+    pos += 1;
+    let num_fx = body[pos];
+    pos += 1;
+    if num_fx != 0 {
+        return 0; // has effect slots; skip rather than risk mis-parsing
+    }
+
+    // Metadata fx: bIsOverrideParentMetadata(1) uNumFx(1) [+ fx list when uNumFx > 0]
+    if pos + 2 > obj_end {
+        return 0;
+    }
+    pos += 1;
+    let num_fx_meta = body[pos];
+    pos += 1;
+    if num_fx_meta != 0 {
+        return 0;
+    }
+
+    // bOverrideAttachmentParams(1) OverrideBusId(4) DirectParentID(4) byBitVector(1)
+    pos += 10;
+
+    // NodeInitialParams AkPropBundle: cProps(1) + cProps*pID(1) + cProps*pValue(4)
+    if pos + 1 > obj_end {
+        return 0;
+    }
+    let cprops = body[pos] as usize;
+    pos += 1;
+    let pid_array = pos;
+    let pvalue_array = pos + cprops;
+    if pvalue_array + cprops * 4 > obj_end {
+        return 0;
+    }
+
+    let mut cleared = 0;
+    for i in 0..cprops {
+        let pid = body[pid_array + i];
+        if pid == PROP_LPF || pid == PROP_HPF {
+            let vo = pvalue_array + i * 4;
+            body[vo..vo + 4].copy_from_slice(&0f32.to_le_bytes());
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
+/// Make every `CAkSound` whose sourceID is in `source_ids` ignore the effects it would otherwise
+/// inherit from its parent actor-mixer chain, by setting `bIsOverrideParentFX` so the sound uses
+/// its own (empty) effect list. Size-neutral (flips one byte). Sounds that carry their own effects
+/// (`uNumFx > 0`) or an inline source are left untouched. Returns the number changed.
+///
+/// Targets the Wwise bank version 145 `CAkSound` layout used by Marvel Rivals.
+pub fn override_parent_fx(bnk: &mut BnkFile, source_ids: &HashSet<u32>) -> usize {
+    for sec in &mut bnk.sections {
+        if let Section::Raw(rs) = sec
+            && &rs.tag == b"HIRC"
+        {
+            return override_parent_fx_in_hirc(&mut rs.body, source_ids);
+        }
+    }
+    0
+}
+
+fn override_parent_fx_in_hirc(body: &mut [u8], source_ids: &HashSet<u32>) -> usize {
+    let n = body.len();
+    if n < 4 {
+        return 0;
+    }
+    let num_objects = read_le_u32(body, 0) as usize;
+    let mut pos = 4usize;
+    let mut changed = 0usize;
+
+    for _ in 0..num_objects {
+        if pos + 9 > n {
+            break;
+        }
+        let obj_type = body[pos];
+        let obj_size = read_le_u32(body, pos + 1) as usize;
+        let obj_body = pos + 9;
+        let obj_end = pos + 5 + obj_size;
+        if obj_end > n {
+            break;
+        }
+
+        // CAkSound NodeInitialFxParams: bIsOverrideParentFX at obj_body+14, uNumFx at obj_body+15.
+        if obj_type == 2
+            && obj_body + 16 <= obj_end
+            && body[obj_body + 13] & 0x80 == 0
+            && body[obj_body + 15] == 0
+            && source_ids.contains(&read_le_u32(body, obj_body + 5))
+        {
+            body[obj_body + 14] = 1;
+            changed += 1;
+        }
+
+        pos = obj_end;
+    }
+    changed
+}
+
+/// Byte offset where a HIRC object's `NodeBaseParams` begins, or `None` for a type this does not
+/// parse. `CAkSound` (2) prefixes it with a 14-byte `AkBankSourceData`; containers and actor-mixers
+/// (`CAkRanSeqCntr` 5, `CAkSwitchCntr` 6, `CAkActorMixer` 7, `CAkLayerCntr` 9) start it right after
+/// `ulID`.
+fn node_base_start(body: &[u8], obj_type: u8, obj_body: usize, obj_end: usize) -> Option<usize> {
+    match obj_type {
+        2 if obj_body + 14 <= obj_end && body[obj_body + 13] & 0x80 == 0 => Some(obj_body + 14),
+        5 | 6 | 7 | 9 => Some(obj_body),
+        _ => None,
+    }
+}
+
+/// A node's resolved bus routing and the byte offset of its `OverrideBusId` field in the HIRC body.
+struct NodeBus {
+    bus_offset: usize,
+    override_bus: u32,
+    direct_parent: u32,
+}
+
+/// Walk a `NodeBaseParams` from `start` (the byte after the node's type-specific prefix) to its
+/// `OverrideBusId`/`DirectParentID`. Returns `None` on a layout this does not understand.
+fn read_node_bus(body: &[u8], start: usize, end: usize) -> Option<NodeBus> {
+    let mut pos = start;
+
+    // NodeInitialFxParams: bIsOverrideParentFX(1) uNumFx(1) [bitsFXBypass(1) + uNumFx*7]
+    if pos + 2 > end {
+        return None;
+    }
+    pos += 1;
+    let num_fx = body[pos];
+    pos += 1;
+    if num_fx > 0 {
+        pos += 1 + num_fx as usize * 7;
+    }
+
+    // Metadata fx: bIsOverrideParentMetadata(1) uNumFx(1) [+ list]
+    if pos + 2 > end {
+        return None;
+    }
+    pos += 1;
+    let num_fx_meta = body[pos];
+    pos += 1;
+    if num_fx_meta != 0 {
+        return None;
+    }
+
+    // bOverrideAttachmentParams(1) OverrideBusId(4) DirectParentID(4)
+    if pos + 9 > end {
+        return None;
+    }
+    pos += 1;
+    let bus_offset = pos;
+    let override_bus = read_le_u32(body, pos);
+    let direct_parent = read_le_u32(body, pos + 4);
+    Some(NodeBus {
+        bus_offset,
+        override_bus,
+        direct_parent,
+    })
+}
+
+/// Re-point every `CAkSound` whose sourceID is in `source_ids` from `from_bus` to `to_bus`, but
+/// only when the sound currently resolves to `from_bus` (directly or up its parent chain).
+///
+/// This lets a replaced sound bypass always-on effects living on `from_bus` (e.g. an announcer
+/// EQ/compressor) by routing it to a cleaner ancestor bus instead. Size-neutral (rewrites the
+/// 4-byte `OverrideBusId` in place). Sounds that resolve to any other bus are left untouched, so a
+/// changed bank hierarchy is never mis-wired. Returns the number of sounds rerouted.
+pub fn reroute_sound_bus(
+    bnk: &mut BnkFile,
+    source_ids: &HashSet<u32>,
+    from_bus: u32,
+    to_bus: u32,
+) -> usize {
+    for sec in &mut bnk.sections {
+        if let Section::Raw(rs) = sec
+            && &rs.tag == b"HIRC"
+        {
+            return reroute_in_hirc(&mut rs.body, source_ids, from_bus, to_bus);
+        }
+    }
+    0
+}
+
+fn reroute_in_hirc(
+    body: &mut [u8],
+    source_ids: &HashSet<u32>,
+    from_bus: u32,
+    to_bus: u32,
+) -> usize {
+    let n = body.len();
+    if n < 4 {
+        return 0;
+    }
+    let num_objects = read_le_u32(body, 0) as usize;
+
+    // Pass 1: map node id -> (override_bus, direct_parent) for the node types that can route or
+    // parent a sound, and remember each target sound's OverrideBusId offset for rewriting.
+    let mut nodes: HashMap<u32, (u32, u32)> = HashMap::new();
+    let mut targets: Vec<(u32, usize)> = Vec::new();
+    let mut pos = 4usize;
+
+    for _ in 0..num_objects {
+        if pos + 9 > n {
+            break;
+        }
+        let obj_type = body[pos];
+        let obj_size = read_le_u32(body, pos + 1) as usize;
+        let obj_body = pos + 9;
+        let obj_end = pos + 5 + obj_size;
+        if obj_end > n {
+            break;
+        }
+        let ul_id = read_le_u32(body, pos + 5);
+
+        if let Some(start) = node_base_start(body, obj_type, obj_body, obj_end)
+            && let Some(nb) = read_node_bus(body, start, obj_end)
+        {
+            nodes.insert(ul_id, (nb.override_bus, nb.direct_parent));
+            if obj_type == 2 && source_ids.contains(&read_le_u32(body, obj_body + 5)) {
+                targets.push((ul_id, nb.bus_offset));
+            }
+        }
+
+        pos = obj_end;
+    }
+
+    // Pass 2: reroute each target sound whose resolved bus is the one we mean to bypass.
+    let mut rerouted = 0;
+    for (id, bus_offset) in targets {
+        if resolve_bus(&nodes, id) == Some(from_bus) {
+            body[bus_offset..bus_offset + 4].copy_from_slice(&to_bus.to_le_bytes());
+            rerouted += 1;
+        }
+    }
+    rerouted
+}
+
+/// Resolve a node's effective output bus by following `DirectParentID` until a non-zero
+/// `OverrideBusId` is found. `None` if the chain leaves the bank or loops.
+fn resolve_bus(nodes: &HashMap<u32, (u32, u32)>, start: u32) -> Option<u32> {
+    let mut cur = start;
+    let mut seen = HashSet::new();
+    while seen.insert(cur) {
+        let (override_bus, parent) = nodes.get(&cur).copied()?;
+        if override_bus != 0 {
+            return Some(override_bus);
+        }
+        if parent == 0 {
+            return None;
+        }
+        cur = parent;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a one-object HIRC body holding a version-145 `CAkSound` with `source_id` and a
+    /// `NodeInitialParams` prop bundle carrying Volume(0)=1.0, LPF(3)=15.0, HPF(4)=35.0.
+    fn hirc_with_sound(source_id: u32) -> Vec<u8> {
+        let mut obj = Vec::new();
+        obj.extend_from_slice(&1000u32.to_le_bytes()); // ulID
+        // AkBankSourceData
+        obj.extend_from_slice(&0x0004_0001u32.to_le_bytes()); // ulPluginID (VORBIS)
+        obj.push(0); // StreamType: Data/bnk
+        obj.extend_from_slice(&source_id.to_le_bytes()); // sourceID
+        obj.extend_from_slice(&999u32.to_le_bytes()); // uInMemoryMediaSize
+        obj.push(0); // uSourceBits (bHasSource = 0)
+        // NodeBaseParams
+        obj.push(0); // bIsOverrideParentFX
+        obj.push(0); // uNumFx
+        obj.push(0); // bIsOverrideParentMetadata
+        obj.push(0); // uNumFx (metadata)
+        obj.push(0); // bOverrideAttachmentParams
+        obj.extend_from_slice(&0u32.to_le_bytes()); // OverrideBusId
+        obj.extend_from_slice(&0u32.to_le_bytes()); // DirectParentID
+        obj.push(0); // byBitVector
+        // NodeInitialParams AkPropBundle
+        obj.push(3); // cProps
+        obj.extend_from_slice(&[0u8, PROP_LPF, PROP_HPF]); // pID array
+        obj.extend_from_slice(&1.0f32.to_le_bytes()); // Volume
+        obj.extend_from_slice(&15.0f32.to_le_bytes()); // LPF
+        obj.extend_from_slice(&35.0f32.to_le_bytes()); // HPF
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // num objects
+        body.push(2); // CAkSound
+        body.extend_from_slice(&(obj.len() as u32).to_le_bytes()); // dwSectionSize
+        body.extend_from_slice(&obj);
+        body
+    }
+
+    fn bnk_with_hirc(body: Vec<u8>) -> BnkFile {
+        BnkFile {
+            name: "test".into(),
+            wems: Vec::new(),
+            sections: vec![Section::Raw(RawSection {
+                tag: *b"HIRC",
+                body,
+            })],
+        }
+    }
+
+    fn props(bnk: &BnkFile) -> [f32; 3] {
+        let Section::Raw(rs) = &bnk.sections[0] else {
+            panic!("expected HIRC raw section");
+        };
+        let n = rs.body.len();
+        let base = n - 12; // three f32 pValues at the tail
+        [
+            f32::from_le_bytes(rs.body[base..base + 4].try_into().unwrap()),
+            f32::from_le_bytes(rs.body[base + 4..base + 8].try_into().unwrap()),
+            f32::from_le_bytes(rs.body[base + 8..base + 12].try_into().unwrap()),
+        ]
+    }
+
+    #[test]
+    fn zeroes_lpf_hpf_for_targeted_source() {
+        let mut bnk = bnk_with_hirc(hirc_with_sound(12345));
+        let cleared = clear_sound_filters(&mut bnk, &HashSet::from([12345u32]));
+        assert_eq!(cleared, 2);
+        // Volume untouched; LPF and HPF zeroed.
+        assert_eq!(props(&bnk), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn leaves_untargeted_source_untouched() {
+        let mut bnk = bnk_with_hirc(hirc_with_sound(12345));
+        let cleared = clear_sound_filters(&mut bnk, &HashSet::from([99999u32]));
+        assert_eq!(cleared, 0);
+        assert_eq!(props(&bnk), [1.0, 15.0, 35.0]);
+    }
+
+    fn node_base_bytes(override_bus: u32, direct_parent: u32) -> Vec<u8> {
+        // bIsOverrideParentFX, uNumFx, bIsOverrideParentMetadata, uNumFx, bOverrideAttachmentParams
+        let mut v = vec![0u8; 5];
+        v.extend_from_slice(&override_bus.to_le_bytes()); // OverrideBusId
+        v.extend_from_slice(&direct_parent.to_le_bytes()); // DirectParentID
+        v
+    }
+
+    fn wrap_obj(obj_type: u8, inner: Vec<u8>) -> Vec<u8> {
+        let mut obj = vec![obj_type];
+        obj.extend_from_slice(&(inner.len() as u32).to_le_bytes()); // dwSectionSize
+        obj.extend_from_slice(&inner);
+        obj
+    }
+
+    /// A streamed `CAkSound` with no baked props, routed via its parent.
+    fn sound_obj(ul_id: u32, source_id: u32, override_bus: u32, parent: u32) -> Vec<u8> {
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&ul_id.to_le_bytes());
+        inner.extend_from_slice(&0x0004_0001u32.to_le_bytes()); // ulPluginID
+        inner.push(1); // StreamType: PrefetchStreaming
+        inner.extend_from_slice(&source_id.to_le_bytes());
+        inner.extend_from_slice(&0u32.to_le_bytes()); // uInMemoryMediaSize
+        inner.push(9); // uSourceBits (bHasSource = 0)
+        inner.extend_from_slice(&node_base_bytes(override_bus, parent));
+        wrap_obj(2, inner)
+    }
+
+    /// A container/actor-mixer node (NodeBaseParams right after ulID): type 5/6/7/9.
+    fn container_obj(obj_type: u8, ul_id: u32, override_bus: u32, parent: u32) -> Vec<u8> {
+        let mut inner = ul_id.to_le_bytes().to_vec();
+        inner.extend_from_slice(&node_base_bytes(override_bus, parent));
+        wrap_obj(obj_type, inner)
+    }
+
+    fn mixer_obj(ul_id: u32, override_bus: u32, parent: u32) -> Vec<u8> {
+        container_obj(7, ul_id, override_bus, parent)
+    }
+
+    fn hirc_body(objs: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(objs.len() as u32).to_le_bytes());
+        for o in objs {
+            body.extend_from_slice(o);
+        }
+        body
+    }
+
+    /// The sound is the first object, so its OverrideBusId lands at body offset 32.
+    fn sound_bus(bnk: &BnkFile) -> u32 {
+        let Section::Raw(rs) = &bnk.sections[0] else {
+            panic!("expected HIRC raw section");
+        };
+        u32::from_le_bytes(rs.body[32..36].try_into().unwrap())
+    }
+
+    #[test]
+    fn reroutes_sound_resolving_to_source_bus() {
+        let (from_bus, to_bus) = (3919227308u32, 812276737u32);
+        let sound = sound_obj(277881354, 980924621, 0, 29931845);
+        let mixer = mixer_obj(29931845, from_bus, 0);
+        let mut bnk = bnk_with_hirc(hirc_body(&[sound, mixer]));
+        let n = reroute_sound_bus(&mut bnk, &HashSet::from([980924621u32]), from_bus, to_bus);
+        assert_eq!(n, 1);
+        assert_eq!(sound_bus(&bnk), to_bus);
+    }
+
+    #[test]
+    fn leaves_sound_on_other_bus_untouched() {
+        let (from_bus, to_bus) = (3919227308u32, 812276737u32);
+        let sound = sound_obj(277881354, 980924621, 0, 29931845);
+        let mixer = mixer_obj(29931845, 111u32, 0); // resolves to a different bus
+        let mut bnk = bnk_with_hirc(hirc_body(&[sound, mixer]));
+        let n = reroute_sound_bus(&mut bnk, &HashSet::from([980924621u32]), from_bus, to_bus);
+        assert_eq!(n, 0);
+        assert_eq!(sound_bus(&bnk), 0); // unchanged
+    }
+
+    #[test]
+    fn reroutes_through_switch_container_chain() {
+        // The battle hit-sounds route sound -> CAkSwitchCntr -> CAkActorMixer -> bus.
+        let (from_bus, to_bus) = (1952531228u32, 2791637696u32);
+        let sound = sound_obj(181235746, 975983943, 0, 306721962);
+        let switch = container_obj(6, 306721962, 0, 576717991);
+        let mixer = mixer_obj(576717991, from_bus, 0);
+        let mut bnk = bnk_with_hirc(hirc_body(&[sound, switch, mixer]));
+        let n = reroute_sound_bus(&mut bnk, &HashSet::from([975983943u32]), from_bus, to_bus);
+        assert_eq!(n, 1);
+        assert_eq!(sound_bus(&bnk), to_bus);
+    }
+
+    /// In `hirc_with_sound`, the single sound is the first object, so bIsOverrideParentFX (the byte
+    /// after its 14-byte AkBankSourceData) lands at body offset 27.
+    fn override_fx_flag(bnk: &BnkFile) -> u8 {
+        let Section::Raw(rs) = &bnk.sections[0] else {
+            panic!("expected HIRC raw section");
+        };
+        rs.body[27]
+    }
+
+    #[test]
+    fn override_parent_fx_sets_flag_for_target() {
+        let mut bnk = bnk_with_hirc(hirc_with_sound(12345));
+        assert_eq!(override_fx_flag(&bnk), 0);
+        let n = override_parent_fx(&mut bnk, &HashSet::from([12345u32]));
+        assert_eq!(n, 1);
+        assert_eq!(override_fx_flag(&bnk), 1);
+    }
+
+    #[test]
+    fn override_parent_fx_skips_non_target() {
+        let mut bnk = bnk_with_hirc(hirc_with_sound(12345));
+        let n = override_parent_fx(&mut bnk, &HashSet::from([99999u32]));
+        assert_eq!(n, 0);
+        assert_eq!(override_fx_flag(&bnk), 0);
+    }
+}
